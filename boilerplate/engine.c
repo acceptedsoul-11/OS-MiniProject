@@ -141,6 +141,7 @@ typedef struct {
 
 static volatile sig_atomic_t g_shutdown_requested;
 static volatile sig_atomic_t g_sigchld_seen;
+static volatile sig_atomic_t g_last_shutdown_signal;
 
 static void usage(const char *prog)
 {
@@ -415,6 +416,28 @@ static container_record_t *find_container_by_pid_locked(supervisor_ctx_t *ctx, p
     return NULL;
 }
 
+static int container_is_active(const container_record_t *record)
+{
+    return record->host_pid > 0 &&
+           (record->state == CONTAINER_STARTING || record->state == CONTAINER_RUNNING);
+}
+
+static container_record_t *find_active_container_by_rootfs_locked(supervisor_ctx_t *ctx,
+                                                                  const char *rootfs)
+{
+    container_record_t *cur;
+
+    for (cur = ctx->containers; cur; cur = cur->next) {
+        if (!container_is_active(cur))
+            continue;
+
+        if (strncmp(cur->rootfs, rootfs, sizeof(cur->rootfs)) == 0)
+            return cur;
+    }
+
+    return NULL;
+}
+
 static int register_with_monitor(int monitor_fd,
                                  const char *container_id,
                                  pid_t host_pid,
@@ -662,6 +685,14 @@ static int start_container(supervisor_ctx_t *ctx,
         set_response(resp, 1, "Container id already exists: %s", req->container_id);
         return 1;
     }
+    if (find_active_container_by_rootfs_locked(ctx, req->rootfs)) {
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        set_response(resp,
+                     1,
+                     "Rootfs already in use by a live container: %s",
+                     req->rootfs);
+        return 1;
+    }
     pthread_mutex_unlock(&ctx->metadata_lock);
 
     record = calloc(1, sizeof(*record));
@@ -837,6 +868,7 @@ static int handle_stop(supervisor_ctx_t *ctx,
                        control_response_t *resp)
 {
     container_record_t *record;
+    int attempts;
 
     pthread_mutex_lock(&ctx->metadata_lock);
     record = find_container_by_id_locked(ctx, req->container_id);
@@ -846,6 +878,12 @@ static int handle_stop(supervisor_ctx_t *ctx,
         return 1;
     }
 
+    if (!container_is_active(record)) {
+        set_response(resp, 0, "%s is already %s", req->container_id, state_to_string(record->state));
+        pthread_mutex_unlock(&ctx->metadata_lock);
+        return 0;
+    }
+
     record->stop_requested = 1;
     if (record->host_pid > 0 && kill(record->host_pid, SIGTERM) < 0 && errno != ESRCH) {
         pthread_mutex_unlock(&ctx->metadata_lock);
@@ -853,6 +891,21 @@ static int handle_stop(supervisor_ctx_t *ctx,
         return 1;
     }
     pthread_mutex_unlock(&ctx->metadata_lock);
+
+    for (attempts = 0; attempts < 20; attempts++) {
+        usleep(100000);
+        reap_children(ctx);
+
+        pthread_mutex_lock(&ctx->metadata_lock);
+        record = find_container_by_id_locked(ctx, req->container_id);
+        if (!record || record->host_pid <= 0) {
+            pthread_mutex_unlock(&ctx->metadata_lock);
+            cleanup_finished_containers(ctx);
+            set_response(resp, 0, "Stopped %s", req->container_id);
+            return 0;
+        }
+        pthread_mutex_unlock(&ctx->metadata_lock);
+    }
 
     set_response(resp, 0, "Stop requested for %s", req->container_id);
     return 0;
@@ -884,8 +937,10 @@ static void signal_handler(int signo)
 {
     if (signo == SIGCHLD)
         g_sigchld_seen = 1;
-    else
+    else {
+        g_last_shutdown_signal = signo;
         g_shutdown_requested = 1;
+    }
 }
 
 static int install_signal_handlers(void)
@@ -903,6 +958,7 @@ static int install_signal_handlers(void)
         return -1;
     if (sigaction(SIGTERM, &sa, NULL) < 0)
         return -1;
+    signal(SIGPIPE, SIG_IGN);
     return 0;
 }
 
@@ -1146,6 +1202,12 @@ static int run_supervisor(const char *rootfs)
             }
             handle_client(&ctx, client_fd);
         }
+    }
+
+    if (g_last_shutdown_signal != 0) {
+        fprintf(stderr,
+                "[mini_runtime] supervisor shutting down after signal %d\n",
+                g_last_shutdown_signal);
     }
 
     drain_and_shutdown(&ctx);
