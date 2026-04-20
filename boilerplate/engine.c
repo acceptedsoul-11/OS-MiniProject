@@ -143,6 +143,9 @@ static volatile sig_atomic_t g_shutdown_requested;
 static volatile sig_atomic_t g_sigchld_seen;
 static volatile sig_atomic_t g_last_shutdown_signal;
 
+static void reap_children(supervisor_ctx_t *ctx);
+static void cleanup_finished_containers(supervisor_ctx_t *ctx);
+
 static void usage(const char *prog)
 {
     fprintf(stderr,
@@ -712,6 +715,16 @@ static int start_container(supervisor_ctx_t *ctx,
     strncpy(record->command, req->command, sizeof(record->command) - 1);
     snprintf(record->log_path, sizeof(record->log_path), "%s/%s.log", LOG_DIR, record->id);
     strncpy(record->stop_reason, "running", sizeof(record->stop_reason) - 1);
+
+    {
+        int log_fd = open(record->log_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (log_fd < 0) {
+            set_response(resp, 1, "Failed to initialize log file %s: %s", record->log_path, strerror(errno));
+            free(record);
+            return 1;
+        }
+        close(log_fd);
+    }
 
     if (pipe(pipe_fds) < 0) {
         set_response(resp, 1, "pipe failed: %s", strerror(errno));
